@@ -1453,6 +1453,21 @@ impl Torus {
             return Err(SolidError::sm_err(OP_REBUILD));
         }
 
+        // not upstream (WR-775): the generating interval is the generator's own (its polar
+        // converter's, the NURB's ends measured about its centre), not the one measured at
+        // the sweep's end about a centre placed with the fitted major radius. A major radius
+        // 1e-11 off turns a tube end at right angles to the radial direction by over 1e-9
+        // degrees, past the converter's snap (1000 * SM_EFF_ZERO), and `SmTorus` Test #2
+        // (`HasSameParameterization`) refused the torus. Within the snap the two are the
+        // same value, so this changes nothing there.
+        let gen_ivl = circle.step_interval();
+        let anal_uv_domain = Extent2d::from_bounds(
+            anal_uv_domain.u_interval().min(),
+            gen_ivl.min(),
+            anal_uv_domain.u_interval().max(),
+            gen_ivl.max(),
+        );
+
         // set m_pGenCurve
         self.base.gen_curve = Some(Curve::from(circle));
 
@@ -2129,6 +2144,75 @@ mod tests {
         assert!((r.major_radius() - 3.0).abs() < 1e-9);
         assert!((r.minor_radius() - 1.0).abs() < 1e-9);
         assert!(t.approx_eq(&r));
+    }
+
+    /// A small fillet torus (R 70.168, r 1.089) whose tube ends at 270 degrees, at right
+    /// angles to the radial direction, rebuilt from its NURB form with 1e-13 of rounding
+    /// in the control points (as a body read back from its record has). The fitted major
+    /// radius is then a few 1e-11 off, which turned the tube's end measured at the sweep's
+    /// end by over 1e-9 degrees from the generator's own end, so `SmTorus` Test #2
+    /// (`HasSameParameterization`) refused the torus. The torus takes its generator's
+    /// interval.
+    #[test]
+    fn rebuild_from_a_rounded_nurb_keeps_the_generator_interval() {
+        let mut k = Kernel::default();
+        k.fixes.torus_signed_gen_curve_interval = true;
+        k.fixes.ellipse_open_arc_keeps_end_angle = true;
+        k.fixes.torus_keeps_inside_out = true;
+        let frame = Axis2Placement::new(
+            Vec3::new(10.0, -103.0, 5.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        let dom = Extent2d::from_bounds(0.0, 150.0, 102.0, 270.0);
+        let t = Torus::create_canonical(
+            &k,
+            &frame,
+            70.168_482_052_133_02,
+            1.089_158_666_673_324_2,
+            TorusOptions::default(),
+            Some(&dom),
+        )
+        .expect("torus");
+        let exact = t.base().base().gw_nurb().expect("nurb").compressed_copy();
+
+        // a fixed pseudo-random rounding of up to 1e-13 in each coordinate
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut rounding = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            1e-13 * ((state >> 11) as f64 / (1_u64 << 53) as f64 * 2.0 - 1.0)
+        };
+        for net in 0..8 {
+            let mut nurb = exact.compressed_copy();
+            for i in 0..=nurb.n() {
+                for j in 0..=nurb.m() {
+                    let c = nurb.cpt_mut(i, j).expect("control point");
+                    c.x += rounding();
+                    c.y += rounding();
+                    c.z += rounding();
+                }
+            }
+            let mut r = t.clone();
+            r.base.base.nurb = Some(nurb).into();
+            r.base.base.nurb_is_borrowed = false;
+            r.rebuild_step_from_nurb_parameters(&k).expect("rebuild");
+            assert!((r.major_radius() - t.major_radius()).abs() < 1e-9);
+            assert!((r.minor_radius() - t.minor_radius()).abs() < 1e-9);
+
+            let surface = r.base.anal_uv_domain.v_interval();
+            let gen = crate::surface::surf_of_revolution::p1::gen_step_interval(
+                r.base.gen_curve.as_ref().expect("generator"),
+            )
+            .expect("generator interval");
+            let tol = EFF_ZERO * (1.0 + surface.max_dimension().max(gen.max_dimension()));
+            assert!(
+                surface.is_contained_by(&gen, tol) && gen.is_contained_by(&surface, tol),
+                "net {net}: surface {surface:?}, generator {gen:?}"
+            );
+            assert!((surface.min() - 150.0).abs() < 1e-8 && (surface.max() - 270.0).abs() < 1e-8);
+        }
     }
 
     #[test]
